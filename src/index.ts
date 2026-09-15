@@ -32,6 +32,9 @@ import { DatabaseConnection, getDatabasePath, removeDatabaseFiles } from './db';
 import { WalCheckpointValve, resolveWalValveMb } from './db/wal-valve';
 import { QueryBuilder, type DeprioritizedPathMatcher } from './db/queries';
 import { importPathKeys, moduleReferenceKeys } from './db/reference-tail';
+import { loadHdlProfile } from './hdl/profile';
+import { hdlDependenciesChanged } from './hdl/index-context';
+import { buildHdlProfileStatus, type HdlProfileStatus } from './hdl/status';
 import {
   isInitialized,
   createDirectory,
@@ -843,6 +846,8 @@ export class CodeGraph {
           }
         } catch { /* metadata is advisory — never fail an index over it */ }
 
+        if (result.success && result.filesErrored === 0) this.orchestrator.commitHdlProfile();
+
         // The time covers the whole run, like the totals above. The
         // orchestrator's covers extraction alone, and the summary printed it
         // as the run's, leaving out resolution and linking (#2334).
@@ -888,7 +893,9 @@ export class CodeGraph {
         // reloads its caches, the set of node names included, as indexAll and
         // sync do before they resolve, instead of reading the graph as it was
         // before (#2829).
-        return this.orchestrator.indexFiles(filePaths).finally(() => this.resolver.clearCaches());
+        const result = await this.orchestrator.indexFiles(filePaths).finally(() => this.resolver.clearCaches());
+        if (result.success && result.filesErrored === 0) this.orchestrator.commitHdlProfile();
+        return result;
       } finally {
         this.fileLock.release();
       }
@@ -1368,6 +1375,11 @@ export class CodeGraph {
             result.changedFilePaths ?? [],
             edgesBeforeRetry
           );
+          // A deleted duplicate module can make an HDL binding unique again.
+          // Deletion-only syncs skip the changed-file failed-ref retry above.
+          const hdlRetry = this.queries.getRetryableFailedReferences(result.definitionDelta)
+            .filter(ref => ref.referenceName.startsWith('hdl:wildcard:') || ref.referenceName.startsWith('hdl:port-position:'));
+          if (hdlRetry.length > 0) await this.resolver.resolveAndPersistListYielding(hdlRetry);
           if (process.env.CODEGRAPH_SYNTH_TIMINGS) {
             console.error(
               `[phase-timing] sync-rebind: ${Date.now() - tRebind}ms (${result.definitionDelta.length} changed names, ${rebound} edges re-opened)`
@@ -1439,6 +1451,10 @@ export class CodeGraph {
           }
           if (before !== now) this.stampPythonRootFingerprint(now);
         }
+
+        // Access direction is signature-dependent even if no node name changed.
+        // Re-open typed and still-unclassified HDL argument sites in untouched files.
+        this.orchestrator.resurrectHdlCallArgumentEdges(result.changedFilePaths ?? [], result.filesRemoved > 0);
 
         // Orphan sweep (#1187). A resolution pass that dies mid-run — the #850
         // daemon liveness watchdog's SIGKILL (#1122), Ctrl-C, a crash — leaves
@@ -1555,6 +1571,7 @@ export class CodeGraph {
           try { this.queries.setMetadata('index_state', 'complete'); } catch { /* advisory */ }
         }
 
+        this.orchestrator.commitHdlProfile();
         this.orchestrator.finishGitIndexState(gitState, fullReconcile, result.failedFilePaths);
 
         if (fullReconcile && result.filesChecked > 0) this.pendingFullReconcile = false;
@@ -1633,7 +1650,8 @@ export class CodeGraph {
       options,
       process.platform === 'win32'
         ? (filePath) => this.isIndexedFileStateCurrent(filePath)
-        : undefined
+        : undefined,
+      () => this.getHdlDependencyPaths()
     );
 
     return this.watcher.start();
@@ -1782,6 +1800,28 @@ export class CodeGraph {
    * index built before stamping existed (treated as stale). See
    * `extraction-version.ts` and `isIndexStale()`.
    */
+  getHdlDependencyPaths(): string[] {
+    try {
+      const context = JSON.parse(this.queries.getMetadata('hdl_profile_context') ?? 'null');
+      return Array.isArray(context?.dependencies) ? context.dependencies.flatMap((d: unknown) =>
+        d && typeof d === 'object' && 'path' in d && typeof d.path === 'string' ? [d.path] : []) : [];
+    } catch { return []; }
+  }
+
+  getHdlProfileStatus(): HdlProfileStatus | null {
+    const configuration = loadHdlProfile(this.projectRoot);
+    const metadata = { name: this.queries.getMetadata('hdl_profile_name') || null,
+      fingerprint: this.queries.getMetadata('hdl_profile_fingerprint'), context: this.queries.getMetadata('hdl_profile_context') };
+    const hasHdl = this.queries.hasLanguage('verilog');
+    if (!hasHdl && !metadata.name && configuration.status === 'invalid-config') return null;
+    const status = buildHdlProfileStatus(configuration, metadata, hasHdl);
+    if (status?.state === 'matches' && status.indexed.mode === 'profile' && hdlDependenciesChanged(this.projectRoot, metadata.context)) {
+      status.state = 'mismatch'; status.mismatch = true; status.reindexRecommended = true;
+      status.diagnostics.push('HDL include dependency changed since indexing.');
+    }
+    return status;
+  }
+
   getIndexBuildInfo(): { version: string | null; extractionVersion: number | null } {
     const version = this.queries.getMetadata('indexed_with_version');
     const ev = this.queries.getMetadata('indexed_with_extraction_version');
